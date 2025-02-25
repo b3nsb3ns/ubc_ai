@@ -1,152 +1,45 @@
 from dotenv import load_dotenv
 _ = load_dotenv()
 
-from langgraph.graph import StateGraph, END
-from typing import TypedDict, Annotated, List
-import operator
+from langgraph.graph import StateGraph
 from langgraph.checkpoint.sqlite import SqliteSaver
-#from langgraph.checkpoint.sqlite import SqliteSaver
-from langchain_core.messages import AnyMessage, SystemMessage, HumanMessage, AIMessage, ChatMessage
-#memory = SqliteSaver.from_conn_string(":memory:")
-#memory = SqliteSaver("checkpoint.db")
-memory = SqliteSaver.from_conn_string("sqlite:///checkpoint.db")
-memory = SqliteSaver.from_conn_string("sqlite:///:memory:")
+from prompts import *
+from nodes import *
 
-class AgentState(TypedDict):
-    task: str
-    plan: str
-    draft: str
-    critique: str
-    content: List[str]
-    revision_number: int
-    max_revisions: int
-    
-from langchain_openai import ChatOpenAI
-model = ChatOpenAI(model="gpt-3.5-turbo", temperature=0)
+#memory = SqliteSaver.from_conn_string("sqlite:///:memory:")
+import sqlite3
+conn = sqlite3.connect(":memory:", check_same_thread=False)
+memory = SqliteSaver(conn)
 
-PLAN_PROMPT = """You are an expert writer tasked with writing a high level outline of an essay. \
-Write such an outline for the user provided topic. Give an outline of the essay along with any relevant notes \
-or instructions for the sections."""
+keyword_graph = StateGraph(AgentState)
 
-WRITER_PROMPT = """You are an essay assistant tasked with writing excellent 5-paragraph essays.\
-Generate the best essay possible for the user's request and the initial outline. \
-If the user provides critique, respond with a revised version of your previous attempts. \
-Utilize all the information below as needed: 
+keyword_graph.add_node("keywords", key_words_node)
+keyword_graph.add_node("importance", importance_node)
+keyword_graph.add_node("enrichment", enrichment_node)
+keyword_graph.add_node("query", query_node)
 
-------
+keyword_graph.set_entry_point("keywords")
 
-{content}"""
-
-REFLECTION_PROMPT = """You are a teacher grading an essay submission. \
-Generate critique and recommendations for the user's submission. \
-Provide detailed recommendations, including requests for length, depth, style, etc."""
-
-RESEARCH_PLAN_PROMPT = """You are a researcher charged with providing information that can \
-be used when writing the following essay. Generate a list of search queries that will gather \
-any relevant information. Only generate 3 queries max."""
-
-RESEARCH_CRITIQUE_PROMPT = """You are a researcher charged with providing information that can \
-be used when making any requested revisions (as outlined below). \
-Generate a list of search queries that will gather any relevant information. Only generate 3 queries max."""
-
-
-from pydantic import BaseModel
-class Queries(BaseModel):
-    queries: List[str]
-
-from tavily import TavilyClient
-import os
-tavily = TavilyClient(api_key=os.environ["TAVILY_API_KEY"])
-
-def plan_node(state: AgentState):
-    messages = [
-        SystemMessage(content=PLAN_PROMPT), 
-        HumanMessage(content=state['task'])
-    ]
-    response = model.invoke(messages)
-    return {"plan": response.content}
-
-def research_plan_node(state: AgentState):
-    queries = model.with_structured_output(Queries).invoke([
-        SystemMessage(content=RESEARCH_PLAN_PROMPT),
-        HumanMessage(content=state['task'])
-    ])
-    content = state['content'] or []
-    for q in queries.queries:
-        response = tavily.search(query=q, max_results=2)
-        for r in response['results']:
-            content.append(r['content'])
-    return {"content": content}
-
-def generation_node(state: AgentState):
-    content = "\n\n".join(state['content'] or [])
-    user_message = HumanMessage(
-        content=f"{state['task']}\n\nHere is my plan:\n\n{state['plan']}")
-    messages = [
-        SystemMessage(
-            content=WRITER_PROMPT.format(content=content)
-        ),
-        user_message
-        ]
-    response = model.invoke(messages)
-    return {
-        "draft": response.content, 
-        "revision_number": state.get("revision_number", 1) + 1
-    }
-
-def reflection_node(state: AgentState):
-    messages = [
-        SystemMessage(content=REFLECTION_PROMPT), 
-        HumanMessage(content=state['draft'])
-    ]
-    response = model.invoke(messages)
-    return {"critique": response.content} 
-
-def research_critique_node(state: AgentState):
-    queries = model.with_structured_output(Queries).invoke([
-        SystemMessage(content=RESEARCH_CRITIQUE_PROMPT),
-        HumanMessage(content=state['critique'])
-    ])
-    content = state['content'] or []
-    for q in queries.queries:
-        response = tavily.search(query=q, max_results=2)
-        for r in response['results']:
-            content.append(r['content'])
-    return {"content": content}
-
-def should_continue(state):
-    if state["revision_number"] > state["max_revisions"]:
-        return END
-    return "reflect"
-
-builder = StateGraph(AgentState)
-
-builder.add_node("planner", plan_node)
-builder.add_node("generate", generation_node)
-builder.add_node("reflect", reflection_node)
-builder.add_node("research_plan", research_plan_node)
-builder.add_node("research_critique", research_critique_node)
-
-builder.set_entry_point("planner")
-
-builder.add_conditional_edges(
-    "generate", 
-    should_continue, 
-    {END: END, "reflect": "reflect"}
+keyword_graph.add_conditional_edges(
+    "importance", 
+    should_continue_key_words, 
+    {"query": "query", "enrichment": "enrichment"}
 )
 
-builder.add_edge("planner", "research_plan")
-builder.add_edge("research_plan", "generate")
-builder.add_edge("reflect", "research_critique")
-builder.add_edge("research_critique", "generate")
+keyword_graph.add_edge("keywords", "importance")
+keyword_graph.add_edge("enrichment", "importance")
 
-graph = builder.compile(checkpointer=memory)
+graph = keyword_graph.compile(checkpointer=memory)
 
+task = """cmd-f is a 24-hour hackathon focused on addressing gender inequality in technology. Our main purpose is to create a safe and dedicated space for historically excluded genders to hack together. We’re trying to create access for people who have faced systemic barriers to inclusion on the basis of gender. We encourage participation from women, trans, non-binary, Two-Spirit and gender diverse people. Thus, cmd-f is only open to individuals who identify as a member of an underrepresented gender in technology.
+
+We’re aware that gender is not the only inequality in technology. We appreciate allyship and recognize it is important in the community. We invite allies to show their support by not hacking and instead contributing in other forms, such as volunteering or mentoring. Please make sure your participation in this event is aligned with the intentions of the event. We also ask all participants who attend to trust that everyone attending is meant to be here."""
 thread = {"configurable": {"thread_id": "1"}}
 for s in graph.stream({
-    'task': "what is the difference between langchain and langsmith",
+    'task': task,
     "max_revisions": 2,
-    "revision_number": 1,
+    "revision_number": 0,  # Ensure revision_number starts at 0
+    "key_words": [],  # Initialize key_words as an empty list
+    "content": [],  # Initialize content as an empty list to avoid KeyError
 }, thread):
     print(s)
-
